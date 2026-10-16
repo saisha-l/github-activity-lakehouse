@@ -1,7 +1,10 @@
 # GitHub Activity Lakehouse
 
-A production-style PySpark + Delta Lake pipeline that ingests **GH Archive** data
-through the Medallion architecture: **Bronze → Silver → Gold**.
+An incremental **Spark Structured Streaming** pipeline that ingests **GH Archive**
+events into **Delta Lake** bronze / silver / gold tables, with per-stream
+checkpointing and idempotent `MERGE` upserts for **exactly-once recovery**.
+Built to backfill 100M+ events (a month of GH Archive) and then keep up hour
+by hour, processing only what is new.
 
 ---
 
@@ -17,28 +20,28 @@ through the Medallion architecture: **Bronze → Silver → Gold**.
 ┌──────────────────────────────────────────────────────────────────────┐
 │  data/raw/   2024-01-15-0.json.gz, 2024-01-15-1.json.gz, ...        │
 └─────────────────────────────┬────────────────────────────────────────┘
-                               │  ingest_to_bronze()
+                               │  stream 1: bronze_ingest
+                               │  file source · maxFilesPerTrigger · ckpt/bronze
                                ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │  BRONZE  data/bronze/   (Delta Lake, partitioned by date)            │
-│  • Raw events, schema-on-read                                        │
-│  • Adds _ingested_at audit column                                    │
-│  • Deduplicates within each batch on event id                        │
+│  • Verbatim event in _raw_json + id, type, created_at, _source_file  │
+│  • Insert-only MERGE on id → append-only, never duplicated           │
+│  • Malformed lines → quarantine/bronze (txnAppId/txnVersion append)  │
 └─────────────────────────────┬────────────────────────────────────────┘
-                               │  bronze_to_silver()
+                               │  stream 2: silver_transform
+                               │  Delta source · ckpt/silver
                                ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  SILVER  data/silver/   (Delta Lake, partitioned by date)            │
+│  SILVER  data/silver/   (Delta Lake, partitioned by date, CDF on)    │
 │  • Explicit PySpark schema applied (GH_EVENT_SCHEMA)                 │
-│  • Global dedup via MERGE INTO on event id (handles late data)       │
+│  • Upsert MERGE on id, pruned to the batch's date partitions         │
 │  • Computed columns: date, repo_name, actor_login, event_type        │
-│  • Adds _processed_at audit column                                   │
 │  • Data-quality checks + quarantine for bad records                  │
 └────────────────────┬──────────────────────────────────────┬──────────┘
-                     │  daily_active_repos()                 │
-                     │  pr_merge_time()                      │
-                     │  top_growing_repos()                  │
-                     │  contributor_retention()              │
+                     │  stream 3: gold_incremental           │
+                     │  Change Data Feed · ckpt/gold         │
+                     │  recompute touched keys → MERGE       │
                      ▼                                       │
 ┌────────────────────────────────────────────┐               │
 │  GOLD  data/gold/   (Delta Lake)           │               │
@@ -58,18 +61,22 @@ github-activity-lakehouse/
 ├── .github/workflows/ci.yml     # GitHub Actions CI (Python 3.11, Java 11)
 ├── conf/config.py               # Central configuration (paths, settings)
 ├── src/
-│   ├── bronze/ingest.py         # Bronze ingestion (batch + streaming)
+│   ├── pipeline.py              # Orchestrates the 3 streams (availableNow / continuous)
+│   ├── bronze/ingest.py         # Raw files → Bronze stream (insert-only MERGE)
 │   ├── silver/schema.py         # Explicit GH event StructType
-│   ├── silver/transform.py      # Bronze → Silver transform + MERGE INTO
+│   ├── silver/transform.py      # Bronze → Silver stream (upsert MERGE, CDF)
 │   ├── silver/dq.py             # Data quality checks + quarantine
-│   ├── gold/aggregations.py     # Four Gold aggregation tables
+│   ├── gold/aggregations.py     # Gold table definitions + batch rebuild
+│   ├── gold/incremental.py      # Silver CDF → Gold stream (scoped recompute MERGE)
+│   ├── utils/streaming.py       # Triggers, idempotent MERGE / append helpers
 │   └── utils/spark_session.py   # SparkSession factory with Delta config
 ├── tests/
 │   ├── conftest.py              # Shared pytest fixtures (spark, sample_df)
 │   ├── fixtures/sample_events.json  # 10 realistic fake GH events
 │   ├── test_bronze.py
 │   ├── test_silver.py
-│   └── test_gold.py
+│   ├── test_gold.py
+│   └── test_streaming.py        # Incremental runs + crash/replay recovery
 ├── scripts/
 │   ├── download_data.py         # CLI to download GH Archive files
 │   └── run_pipeline.py          # CLI to run pipeline stages
@@ -90,11 +97,15 @@ cd github-activity-lakehouse
 # 2. Install dependencies (requires Python 3.11, Java 11)
 make install
 
-# 3. Download 3 days of data (~36 × 50 MB files)
+# 3. Download 3 days of data (72 hourly files)
 make download
 
-# 4. Run the full pipeline
+# 4. Run the incremental pipeline (processes only new data, then exits)
 make pipeline
+
+# Full-month backfill (~744 hourly files, 100M+ events), streamed in
+# bounded micro-batches; override the window with BACKFILL_START / BACKFILL_END
+make backfill
 ```
 
 ### Manual pipeline run
@@ -103,14 +114,62 @@ make pipeline
 # Download a specific date range
 PYTHONPATH=. python scripts/download_data.py --start 2024-01-01 --end 2024-01-07
 
-# Run individual stages
-PYTHONPATH=. python scripts/run_pipeline.py --bronze
-PYTHONPATH=. python scripts/run_pipeline.py --silver --dq
-PYTHONPATH=. python scripts/run_pipeline.py --gold
+# Incremental: drain whatever is new through all three streams, then exit.
+# Re-run after every download (cron / Airflow / Databricks Job).
+PYTHONPATH=. python scripts/run_pipeline.py --streaming --bronze --silver --gold --stats
 
-# Or all at once
+# Long-running: all three streams concurrently, 1-minute micro-batches
+PYTHONPATH=. python scripts/run_pipeline.py --streaming --bronze --silver --gold \
+    --trigger-interval "1 minute"
+
+# Batch full rebuild / repair (idempotent; does not touch checkpoints)
 PYTHONPATH=. python scripts/run_pipeline.py --bronze --silver --dq --gold
 ```
+
+---
+
+## Incremental Processing & Exactly-Once Recovery
+
+| Stream | Source | Sink write | Checkpoint |
+|--------|--------|-----------|------------|
+| `bronze_ingest` | `data/raw/` file source (`maxFilesPerTrigger`, default 24 = 1 day) | `MERGE … WHEN NOT MATCHED INSERT` on `id` | `checkpoints/bronze` |
+| `silver_transform` | Bronze Delta table | `MERGE` upsert on `id`, update only if `_ingested_at` is newer | `checkpoints/silver` |
+| `gold_incremental` | Silver **Change Data Feed** | recompute touched keys → `MERGE` (update / insert / delete-stale) | `checkpoints/gold` |
+
+**Why it's exactly-once.** Structured Streaming checkpoints record each
+micro-batch's source offsets before it runs and a commit marker after it
+finishes. If the job dies between the Delta commit and the checkpoint commit,
+the restart replays *the same batch with the same input*. Every sink write is
+idempotent, so the replay changes nothing:
+
+* **Bronze**: insert-only MERGE, so already-present ids are skipped. Delta runs an
+  insert-only merge as a pure append, so Bronze stays a valid append-only
+  streaming source. Quarantine appends carry `txnAppId`/`txnVersion=batchId`,
+  and Delta drops a write whose version it has already committed.
+* **Silver**: matched rows update only when `source._ingested_at > target._ingested_at`.
+  A replay matches every row and updates none.
+* **Gold**: each batch recomputes the affected `(date, repo)`, `event_id`,
+  `repo` and `actor` slices from Silver with the same functions as the batch
+  rebuild, then MERGEs them in. The output is a pure function of Silver, so a
+  replay rewrites identical values.
+
+`tests/test_streaming.py` checks this directly. It deletes the newest
+`commits/<id>` file from each checkpoint (a crash after the sink commit), restarts,
+and asserts the tables are unchanged. It also checks that incrementally
+maintained Gold equals a full batch rebuild.
+
+**Scaling notes**
+
+* GH Archive files are gzip and can't be split (one task per file).
+  `maxFilesPerTrigger` bounds each micro-batch, so memory stays flat however
+  long the backlog is.
+* MERGE conditions include a literal `date IN (...)` predicate built from the
+  batch, so Delta prunes the target down to the 1–2 partitions a batch
+  touches instead of scanning the whole 100M+ row table.
+* Downloads land as hidden `.part` files and are renamed atomically, so the
+  file stream never reads a half-written file.
+* On first start the Gold CDF stream reads the full Silver snapshot, so no
+  separate Gold backfill is needed.
 
 ---
 
@@ -118,23 +177,27 @@ PYTHONPATH=. python scripts/run_pipeline.py --bronze --silver --dq --gold
 
 ### Bronze — Raw Ingestion
 - **Source**: GH Archive NDJSON files downloaded to `data/raw/`
-- **Writer**: Spark batch read (`readStream` with `availableNow=True` for streaming mode)
+- **Reader**: `readStream.format("text")` with a checkpoint, so each file is read once
+- **Writer**: `foreachBatch` → insert-only `MERGE` on `id` (pruned by `date`)
 - **Output**: Delta table at `data/bronze/`, partitioned by `date`
-- **Transforms**: adds `_ingested_at`, derives `date` from `created_at`, deduplicates within each batch
-- **Schema**: schema-on-read (Spark infers types)
+- **Columns**: `id`, `type`, `created_at`, `date`, `_raw_json` (verbatim event), `_source_file`, `_ingested_at`
+- **Bad lines**: no `id` / `created_at` → `data/quarantine/bronze/`
 
 ### Silver — Clean & Typed
-- **Source**: Bronze Delta table
-- **Writer**: `MERGE INTO` on `id` — handles late-arriving duplicates, reruns are idempotent
+- **Source**: Bronze Delta table (streaming source)
+- **Writer**: `foreachBatch` → `MERGE INTO` on `id`, so late duplicates, reruns and replays are idempotent
+- **Change Data Feed**: enabled (`delta.enableChangeDataFeed=true`) to drive incremental Gold
 - **Output**: Delta table at `data/silver/`, partitioned by `date`
 - **Transforms**: explicit `GH_EVENT_SCHEMA` applied, computes `repo_name`, `actor_login`, `event_type`, adds `_processed_at`
 - **DQ checks**: null_rate, schema drift, row count, duplicate rate, quarantine of bad records
 
 ### Gold — Aggregations
+Maintained incrementally by `gold/incremental.py`. `make rebuild` recomputes everything in batch from the same definitions.
+
 | Table | Description |
 |-------|-------------|
 | `daily_active_repos` | Events per repo per day + distinct actor count |
-| `pr_merge_time` | Hours from PR creation to merge for merged PRs |
+| `pr_merge_time` | Hours from PR creation to merge for merged PRs (keyed by `event_id`) |
 | `top_growing_repos` | WatchEvent (star) counts per week + week-over-week growth |
 | `contributor_retention` | Actors active in 2+ consecutive weeks flagged as retained |
 
@@ -206,7 +269,8 @@ PYTHONPATH=. pytest tests/ -v --tb=long
 Tests use `tmp_path` fixtures so they never pollute `data/`.
 
 ### Test coverage
-- **Bronze**: batch read, audit columns, date partitioning, dedup within batch, null-id filtering
+- **Bronze**: audit columns, date partitioning, dedup, idempotent rerun, null-id quarantine, raw JSON retained
+- **Streaming**: only new files are read, cross-file dedup, in-flight downloads ignored, crash-replay idempotency for Bronze / Silver / Gold, incremental Gold == batch rebuild
 - **Silver**: global dedup, MERGE idempotency, derived columns, date extraction, DQ null-rate detection, quarantine
 - **Gold**: daily_active_repos row uniqueness, pr_merge_time merged-only filter, top_growing_repos star counts, contributor retention logic
 
@@ -237,14 +301,10 @@ Tests use `tmp_path` fixtures so they never pollute `data/`.
    sys.path.insert(0, "/Workspace/Repos/your-repo/github-activity-lakehouse")
 
    from src.utils.spark_session import get_spark
-   from src.bronze.ingest import ingest_to_bronze
-   from src.silver.transform import bronze_to_silver
-   from src.gold.aggregations import daily_active_repos, pr_merge_time
+   from src.pipeline import run_incremental_pipeline
 
    spark = get_spark(local=False)  # use existing Databricks cluster session
-   ingest_to_bronze(spark, use_streaming=True)   # use Auto Loader for streaming
-   bronze_to_silver(spark)
-   daily_active_repos(spark)
+   run_incremental_pipeline(spark)   # bronze → silver → gold, availableNow
    ```
 
 6. **Optimise with Delta features**:

@@ -29,7 +29,22 @@ QUARANTINE_PATH = os.path.join(LAKEHOUSE_ROOT, "quarantine")
 # ---------------------------------------------------------------------------
 PARTITION_COL = "date"
 DEDUP_KEY = "id"
-MAX_FILES_PER_TRIGGER = 10
+# Raw GH Archive files per Bronze micro-batch (24 = one day of hourly files).
+MAX_FILES_PER_TRIGGER = int(os.environ.get("MAX_FILES_PER_TRIGGER", "24"))
+# Delta files per Silver / Gold micro-batch.
+DELTA_MAX_FILES_PER_TRIGGER = int(os.environ.get("DELTA_MAX_FILES_PER_TRIGGER", "200"))
+
+# ---------------------------------------------------------------------------
+# Streaming
+# ---------------------------------------------------------------------------
+# Empty  -> Trigger.AvailableNow (drain everything available, then stop).
+# "1 minute" etc. -> long-running processingTime trigger.
+STREAM_TRIGGER_INTERVAL = os.environ.get("STREAM_TRIGGER_INTERVAL", "")
+
+BRONZE_CHECKPOINT = os.path.join(CHECKPOINT_PATH, "bronze")
+SILVER_CHECKPOINT = os.path.join(CHECKPOINT_PATH, "silver")
+GOLD_CHECKPOINT = os.path.join(CHECKPOINT_PATH, "gold")
+BRONZE_QUARANTINE_PATH = os.path.join(QUARANTINE_PATH, "bronze")
 
 # ---------------------------------------------------------------------------
 # GH Archive source

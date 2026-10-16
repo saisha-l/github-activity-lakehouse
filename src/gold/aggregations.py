@@ -1,9 +1,12 @@
 """
 Gold layer — aggregated analytical tables.
 
-Each function reads from the Silver Delta table and writes a Gold Delta table.
-Gold tables are written with ``mergeSchema=true`` and overwritten on each run
-(idempotent), except where incremental MERGE is more appropriate.
+Each table is defined once by a pure ``compute_*`` function (Silver rows in,
+Gold rows out).  Two writers share those definitions:
+
+* the batch functions below — full rebuild, overwrite (idempotent);
+* ``src/gold/incremental.py`` — a Change Data Feed stream that recomputes
+  only the keys touched by each micro-batch and MERGEs them in.
 
 Gold tables produced
 --------------------
@@ -14,6 +17,8 @@ Gold tables produced
 
 Public API
 ----------
+    compute_daily_active_repos(df) / compute_pr_merge_time(df) /
+    compute_top_growing_repos(df) / compute_contributor_retention(df)
     daily_active_repos(spark, silver_path, gold_path)
     pr_merge_time(spark, silver_path, gold_path)
     top_growing_repos(spark, silver_path, gold_path)
@@ -81,7 +86,15 @@ def daily_active_repos(
     logger.info("[Gold] daily_active_repos: reading from %s", silver_path)
     df = _read_silver(spark, silver_path)
 
-    result = (
+    result = compute_daily_active_repos(df).orderBy("date", F.col("event_count").desc())
+
+    _write_gold(result, out_path, partition_cols=["date"])
+    return result
+
+
+def compute_daily_active_repos(df: DataFrame) -> DataFrame:
+    """Silver rows → one row per (date, repo_name)."""
+    return (
         df.filter(F.col("repo_name").isNotNull() & F.col("date").isNotNull())
         .groupBy("date", "repo_name")
         .agg(
@@ -89,11 +102,7 @@ def daily_active_repos(
             F.countDistinct("actor_login").alias("distinct_actors"),
         )
         .withColumn("last_updated_at", F.current_timestamp())
-        .orderBy("date", F.col("event_count").desc())
     )
-
-    _write_gold(result, out_path, partition_cols=["date"])
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -114,8 +123,8 @@ def pr_merge_time(
 
     Schema
     ------
-    date | repo_name | actor_login | pr_number | pr_title |
-    created_at | merged_at | hours_to_merge | last_updated_at
+    event_id | date | repo_name | actor_login | pr_number | pr_title |
+    pr_created_at | merged_at | hours_to_merge | last_updated_at
     """
     from conf.config import GOLD_PR_MERGE_TIME, SILVER_PATH
 
@@ -130,12 +139,21 @@ def pr_merge_time(
         logger.warning("[Gold] pr_merge_time: 'payload' column not found — returning empty DF")
         return spark.createDataFrame([], schema=_PR_MERGE_TIME_EMPTY_SCHEMA(spark))
 
-    result = (
+    result = compute_pr_merge_time(df).orderBy("date", "repo_name")
+
+    _write_gold(result, out_path, partition_cols=["date"])
+    return result
+
+
+def compute_pr_merge_time(df: DataFrame) -> DataFrame:
+    """Silver rows → one row per merged-PR event (keyed by ``event_id``)."""
+    return (
         df.filter(
             (F.col("event_type") == "PullRequestEvent")
             & (F.col("payload.pull_request.merged") == True)  # noqa: E712
         )
         .select(
+            F.col("id").alias("event_id"),
             F.col("date"),
             F.col("repo_name"),
             F.col("actor_login"),
@@ -153,11 +171,7 @@ def pr_merge_time(
             / 3600.0,
         )
         .withColumn("last_updated_at", F.current_timestamp())
-        .orderBy("date", "repo_name")
     )
-
-    _write_gold(result, out_path, partition_cols=["date"])
-    return result
 
 
 def _PR_MERGE_TIME_EMPTY_SCHEMA(spark: SparkSession) -> "pyspark.sql.types.StructType":  # noqa: F821
@@ -165,6 +179,7 @@ def _PR_MERGE_TIME_EMPTY_SCHEMA(spark: SparkSession) -> "pyspark.sql.types.Struc
                                    StructField, StructType, TimestampType,
                                    DateType)
     return StructType([
+        StructField("event_id", StringType(), True),
         StructField("date", DateType(), True),
         StructField("repo_name", StringType(), True),
         StructField("actor_login", StringType(), True),
@@ -204,6 +219,19 @@ def top_growing_repos(
     logger.info("[Gold] top_growing_repos: reading from %s", silver_path)
     df = _read_silver(spark, silver_path)
 
+    result = compute_top_growing_repos(df).orderBy(F.col("wow_growth_rate").desc_nulls_last())
+
+    _write_gold(result, out_path)
+    return result
+
+
+def compute_top_growing_repos(df: DataFrame) -> DataFrame:
+    """
+    Silver rows → one row per (repo_name, year, week).
+
+    The lag window is per repo, so recomputing a repo needs *all* of that
+    repo's WatchEvents — the incremental writer scopes by ``repo_name``.
+    """
     weekly = (
         df.filter(
             (F.col("event_type") == "WatchEvent")
@@ -218,7 +246,7 @@ def top_growing_repos(
 
     # Window for previous week's star count (lag)
     w = Window.partitionBy("repo_name").orderBy("year", "week")
-    result = (
+    return (
         weekly.withColumn("prev_star_count", F.lag("star_count", 1).over(w))
         .withColumn(
             "wow_growth_rate",
@@ -228,11 +256,7 @@ def top_growing_repos(
             ).otherwise(F.lit(None).cast("double")),
         )
         .withColumn("last_updated_at", F.current_timestamp())
-        .orderBy(F.col("wow_growth_rate").desc_nulls_last())
     )
-
-    _write_gold(result, out_path)
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +289,14 @@ def contributor_retention(
     logger.info("[Gold] contributor_retention: reading from %s", silver_path)
     df = _read_silver(spark, silver_path)
 
+    result = compute_contributor_retention(df).orderBy(F.col("active_weeks").desc())
+
+    _write_gold(result, out_path)
+    return result
+
+
+def compute_contributor_retention(df: DataFrame) -> DataFrame:
+    """Silver rows → one row per ``actor_login`` (scoped by actor)."""
     # Step 1: distinct (actor_login, year, week) pairs
     actor_weeks = (
         df.filter(F.col("actor_login").isNotNull() & F.col("date").isNotNull())
@@ -293,7 +325,7 @@ def contributor_retention(
     )
 
     # Step 3: aggregate per actor
-    result = (
+    return (
         actor_weeks.groupBy("actor_login")
         .agg(
             F.countDistinct("week_key").alias("active_weeks"),
@@ -310,8 +342,4 @@ def contributor_retention(
         )
         .drop("consecutive_week_pairs")
         .withColumn("last_updated_at", F.current_timestamp())
-        .orderBy(F.col("active_weeks").desc())
     )
-
-    _write_gold(result, out_path)
-    return result

@@ -30,12 +30,9 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-import pytest
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import (BooleanType, DateType, IntegerType, LongType,
-                                StringType, StructField, StructType,
-                                TimestampType)
+from pyspark.sql.types import StringType, StructField, StructType
 
 
 # ---------------------------------------------------------------------------

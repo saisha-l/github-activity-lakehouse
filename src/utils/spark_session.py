@@ -11,6 +11,7 @@ Usage
 from __future__ import annotations
 
 import os
+import sys
 from typing import Optional
 
 from pyspark.sql import SparkSession
@@ -65,16 +66,26 @@ def get_spark(
                 "org.apache.spark.sql.delta.storage.HDFSLogStore")
         # --- Merge schema support ---
         .config("spark.databricks.delta.schema.autoMerge.enabled", "true")
+        # --- Structured Streaming ---
+        # Keep enough progress history to report totals for long backfills.
+        .config("spark.sql.streaming.numRecentProgressUpdates", "1000")
     )
 
     if local:
         builder = builder.master("local[*]")
+        # Python workers must use the driver's interpreter (e.g. the venv).
+        os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
 
     # Allow the Delta JAR to be picked up from the environment when running
     # locally.  On Databricks / EMR the runtime already bundles Delta.
     delta_jar = os.environ.get("DELTA_JAR", "")
     if delta_jar:
         builder = builder.config("spark.jars", delta_jar)
+    elif local:
+        # pip-installed delta-spark: add the matching Delta jars to the session.
+        from delta import configure_spark_with_delta_pip
+
+        builder = configure_spark_with_delta_pip(builder)
 
     spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")

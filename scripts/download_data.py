@@ -16,6 +16,7 @@ Options
 --raw-path PATH   Override the raw data directory (default: data/raw)
 --overwrite       Re-download files even if they already exist
 --workers N       Number of parallel download workers (default: 4)
+--force           Skip the free-disk-space check
 """
 
 from __future__ import annotations
@@ -24,10 +25,11 @@ import argparse
 import concurrent.futures
 import logging
 import os
+import shutil
 import sys
 from datetime import date, timedelta
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 # Ensure project root is on sys.path when run as a script
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -35,7 +37,7 @@ _PROJECT_ROOT = _SCRIPT_DIR.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from tqdm import tqdm
+from tqdm import tqdm  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,14 +83,45 @@ def _download_one(
     Returns (date_str, hour, success, message).
     """
     date_str, hour, raw_path, overwrite = args
-    from src.bronze.ingest import download_gharchive
-
     try:
+        from src.bronze.download import download_gharchive
+
         path = download_gharchive(date_str, hour, raw_path=raw_path, overwrite=overwrite)
         size_mb = os.path.getsize(path) / 1_048_576
         return date_str, hour, True, f"OK ({size_mb:.1f} MB)"
     except Exception as exc:
         return date_str, hour, False, str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Disk-space preflight
+# ---------------------------------------------------------------------------
+
+# 2024 hourly files are ~75–125 MB gzipped.  Bronze keeps the raw JSON and
+# Silver a typed copy (both compressed Parquet), so budget ~2× the raw size on
+# top of the downloads themselves.
+_EST_MB_PER_FILE = 100
+_LAKEHOUSE_OVERHEAD = 2.0
+
+
+def _check_disk_space(raw_path: str, tasks: list, overwrite: bool, force: bool) -> None:
+    pending = [
+        t for t in tasks
+        if overwrite or not os.path.exists(os.path.join(raw_path, f"{t[0]}-{t[1]}.json.gz"))
+    ]
+    need_gb = len(pending) * _EST_MB_PER_FILE * (1 + _LAKEHOUSE_OVERHEAD) / 1024
+    free_gb = shutil.disk_usage(raw_path).free / 1024 ** 3
+    logger.info(
+        "Disk check: %d new files ≈ %.0f GB raw, ≈ %.0f GB incl. Bronze/Silver; %.1f GB free",
+        len(pending), need_gb / (1 + _LAKEHOUSE_OVERHEAD), need_gb, free_gb,
+    )
+    if need_gb > free_gb and not force:
+        max_days = free_gb / (24 * _EST_MB_PER_FILE * (1 + _LAKEHOUSE_OVERHEAD) / 1024)
+        sys.exit(
+            f"Not enough disk space: need ≈ {need_gb:.0f} GB, have {free_gb:.1f} GB "
+            f"(≈ {max_days:.1f} day(s) of data fits).  Shrink --start/--end, point "
+            "LAKEHOUSE_ROOT at a bigger disk or cloud storage, or pass --force."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +169,11 @@ def main() -> None:
         help="Re-download already-existing files",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Download even if the free-disk-space check fails",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=4,
@@ -158,6 +196,8 @@ def main() -> None:
     ]
 
     total = len(tasks)
+
+    _check_disk_space(raw_path, tasks, args.overwrite, args.force)
     logger.info(
         "Downloading %d files  (dates: %s→%s, %d hour(s) each, workers: %d)",
         total,
@@ -183,7 +223,7 @@ def main() -> None:
                     skipped += 1
 
     # Summary
-    print(f"\nDownload summary:")
+    print("\nDownload summary:")
     print(f"  Total tasks : {total}")
     print(f"  Succeeded   : {total - len(failed)}")
     print(f"  Skipped     : {skipped}")

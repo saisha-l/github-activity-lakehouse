@@ -28,6 +28,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 FIXTURES_DIR = PROJECT_ROOT / "tests" / "fixtures"
 
+# Python UDF workers must match the driver's interpreter (e.g. the venv), not
+# whatever ``python3`` is first on PATH.
+os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+
 
 # ---------------------------------------------------------------------------
 # SparkSession fixture
@@ -42,9 +46,10 @@ def spark() -> SparkSession:
     Using session scope means the JVM is started only once per test run,
     keeping test times manageable.
     """
+    from delta import configure_spark_with_delta_pip
     from pyspark.sql import SparkSession
 
-    spark = (
+    builder = (
         SparkSession.builder.appName("lakehouse-tests")
         .master("local[2]")
         .config(
@@ -60,8 +65,11 @@ def spark() -> SparkSession:
         .config("spark.sql.adaptive.enabled", "false")  # deterministic for tests
         .config("spark.delta.logStore.class",
                 "org.apache.spark.sql.delta.storage.HDFSLogStore")
-        .getOrCreate()
+        .config("spark.databricks.delta.schema.autoMerge.enabled", "true")
+        .config("spark.databricks.delta.snapshotPartitions", "2")
+        .config("spark.ui.enabled", "false")
     )
+    spark = configure_spark_with_delta_pip(builder).getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
     yield spark
     spark.stop()

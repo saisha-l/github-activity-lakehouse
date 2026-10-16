@@ -28,15 +28,13 @@ test_silver_merge_updates_existing_row
 
 from __future__ import annotations
 
-import json
 import shutil
 from pathlib import Path
 
 import pytest
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import (BooleanType, StringType, StructField,
-                                StructType, TimestampType)
+from pyspark.sql.types import BooleanType, StringType, StructField, StructType
 
 
 # ---------------------------------------------------------------------------
@@ -148,12 +146,6 @@ class TestSilverTransform:
         silver_path = str(tmp_path / "silver_update")
 
         # --- Initial write: event id 'X001' with type PushEvent ---
-        schema = StructType([
-            StructField("id", StringType(), True),
-            StructField("type", StringType(), True),
-            StructField("created_at", TimestampType(), True),
-            StructField("public", BooleanType(), True),
-        ])
         initial = spark.createDataFrame(
             [("X001", "PushEvent", "2024-01-15T10:00:00", True)],
             schema=StructType([

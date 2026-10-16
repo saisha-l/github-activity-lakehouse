@@ -1,0 +1,10 @@
+# Lakehouse data, checkpoints and local envs
+data/
+spark-warehouse/
+metastore_db/
+derby.log
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store

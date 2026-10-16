@@ -1,9 +1,19 @@
 # GitHub Activity Lakehouse — Makefile
 # Run `make help` for a summary of available targets.
 
-.PHONY: help install test lint download pipeline clean
+.PHONY: help install test lint download pipeline stream backfill rebuild stats clean
 
-PYTHON ?= python3
+# Prefer the project venv (has pyspark/delta) over whatever python3 is on PATH.
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
+
+# Spark 3.5 supports Java 8/11/17.  On macOS pick a JDK 17 if one is installed
+# and JAVA_HOME isn't already set.
+ifeq ($(JAVA_HOME),)
+JAVA_HOME := $(shell /usr/libexec/java_home -v 17 2>/dev/null)
+endif
+ifneq ($(JAVA_HOME),)
+export JAVA_HOME
+endif
 
 help:
 	@echo ""
@@ -13,7 +23,11 @@ help:
 	@echo "  make test       Run the full test suite (pytest)"
 	@echo "  make lint       Run flake8 style checks"
 	@echo "  make download   Download 3 days of GH Archive data (2024-01-01 to 2024-01-03)"
-	@echo "  make pipeline   Run the full pipeline (Bronze → Silver → Gold)"
+	@echo "  make pipeline   Incremental streaming run (availableNow): only new data, then exit"
+	@echo "  make stream     Long-running streaming pipeline (1-minute micro-batches)"
+	@echo "  make backfill   Download a month of GH Archive (BACKFILL_START..BACKFILL_END) and stream it"
+	@echo "  make rebuild    Batch full rebuild of every layer (idempotent)"
+	@echo "  make stats      Print row counts / Delta versions of every table"
 	@echo "  make clean      Remove generated data/ directories"
 	@echo ""
 
@@ -21,13 +35,14 @@ help:
 # install
 # ---------------------------------------------------------------------------
 install:
-	pip install -r requirements.txt
+	test -d .venv || python3 -m venv .venv
+	.venv/bin/pip install -r requirements.txt
 
 # ---------------------------------------------------------------------------
 # test
 # ---------------------------------------------------------------------------
 test:
-	PYTHONPATH=. pytest tests/ -v --tb=short
+	PYTHONPATH=. $(PYTHON) -m pytest tests/ -v --tb=short
 
 # ---------------------------------------------------------------------------
 # lint
@@ -50,9 +65,29 @@ download:
 # ---------------------------------------------------------------------------
 # pipeline
 # ---------------------------------------------------------------------------
+BACKFILL_START ?= 2024-01-01
+BACKFILL_END   ?= 2024-01-31
+
 pipeline:
+	PYTHONPATH=. $(PYTHON) scripts/run_pipeline.py --streaming \
+		--bronze --silver --gold --dq --stats
+
+stream:
+	PYTHONPATH=. $(PYTHON) scripts/run_pipeline.py --streaming \
+		--bronze --silver --gold --trigger-interval "1 minute"
+
+backfill:
+	PYTHONPATH=. $(PYTHON) scripts/download_data.py \
+		--start $(BACKFILL_START) --end $(BACKFILL_END) --workers 8
+	PYTHONPATH=. $(PYTHON) scripts/run_pipeline.py --streaming \
+		--bronze --silver --gold --dq --stats
+
+rebuild:
 	PYTHONPATH=. $(PYTHON) scripts/run_pipeline.py \
-		--bronze --silver --dq --gold
+		--bronze --silver --dq --gold --stats
+
+stats:
+	PYTHONPATH=. $(PYTHON) scripts/run_pipeline.py --stats
 
 # ---------------------------------------------------------------------------
 # clean
