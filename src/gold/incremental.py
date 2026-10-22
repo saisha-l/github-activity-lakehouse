@@ -46,7 +46,8 @@ from src.utils.streaming import (build_trigger, partition_values,
 
 logger = logging.getLogger(__name__)
 
-_CDF_META_COLS = ["_change_type", "_commit_version", "_commit_timestamp"]
+# Silver columns that identify which Gold keys a changed row touches.
+_CHANGE_KEY_COLS = ["id", "date", "repo_name", "actor_login", "event_type"]
 
 
 def start_gold_stream(
@@ -118,7 +119,10 @@ def _write_gold_batch(
     spark = batch_df.sparkSession
     # Pre- and post-images both count: an update that moved an event to a
     # different repo/date must refresh the old key as well as the new one.
-    changes = batch_df.drop(*_CDF_META_COLS).persist()
+    # Only the key columns are needed to find affected aggregates; persisting
+    # whole Silver rows (with their large ``payload`` structs) exhausts the
+    # heap on multi-million-row batches.
+    changes = batch_df.select(*_CHANGE_KEY_COLS).persist()
     try:
         if changes.isEmpty():
             return

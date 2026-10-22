@@ -109,7 +109,7 @@ def start_silver_stream(
     appends, so it is a valid append-only streaming source.  OPTIMIZE
     commits (``dataChange=false``) are skipped automatically.
     """
-    from conf.config import (BRONZE_PATH, DELTA_MAX_FILES_PER_TRIGGER,
+    from conf.config import (BRONZE_PATH, SILVER_MAX_FILES_PER_TRIGGER,
                              SILVER_CHECKPOINT, SILVER_PATH,
                              STREAM_TRIGGER_INTERVAL)
     from src.bronze.ingest import _ensure_bronze_table
@@ -124,7 +124,7 @@ def start_silver_stream(
 
     source = (
         spark.readStream.format("delta")
-        .option("maxFilesPerTrigger", max_files_per_trigger or DELTA_MAX_FILES_PER_TRIGGER)
+        .option("maxFilesPerTrigger", max_files_per_trigger or SILVER_MAX_FILES_PER_TRIGGER)
         .load(bronze_path)
     )
 

@@ -16,6 +16,7 @@ test_bronze_stream_only_reads_new_files
 test_bronze_stream_dedups_across_files
 test_bronze_replay_after_crash_is_idempotent
 test_bronze_stream_ignores_in_flight_downloads
+test_bronze_clean_source_deletes_only_committed_files
 test_silver_replay_after_crash_is_idempotent
 test_silver_has_change_data_feed
 test_incremental_gold_matches_batch_rebuild
@@ -302,3 +303,33 @@ def test_bronze_stream_ignores_in_flight_downloads(spark: SparkSession, tmp_path
     lake.add_file("2024-01-15-1.json", _fixture_lines()[1:3])
     _run_bronze(spark, lake)
     assert _read(spark, lake.bronze).count() == 2
+
+
+def test_bronze_clean_source_deletes_only_committed_files(
+    spark: SparkSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``RAW_CLEAN_SOURCE=delete`` removes a raw file only once its batch is committed."""
+    import time
+
+    import conf.config
+
+    monkeypatch.setattr(conf.config, "RAW_CLEAN_SOURCE", "delete")
+    lake = Lake(tmp_path)
+    lines = _fixture_lines()
+    lake.add_file("2024-01-15-0.json", lines[:4])
+    lake.add_file("2024-01-15-1.json", lines[4:7])
+    lake.add_file("2024-01-15-2.json", lines[7:])
+    _run_bronze(spark, lake)  # one file per micro-batch
+
+    # Spark deletes a batch's files when the next batch starts (asynchronously),
+    # so everything but the last batch's file goes away.  (Batch order follows
+    # file mtimes, which tie here, so which file is last isn't fixed.)
+    deadline = time.time() + 10
+    while time.time() < deadline and len(list(lake.raw.glob("*.json"))) > 1:
+        time.sleep(0.2)
+    assert len(list(lake.raw.glob("*.json"))) == 1
+    assert _read(spark, lake.bronze).count() == 9
+
+    # A rerun must not re-ingest anything, deleted or not.
+    _run_bronze(spark, lake)
+    assert _read(spark, lake.bronze).count() == 9

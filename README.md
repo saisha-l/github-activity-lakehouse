@@ -3,8 +3,9 @@
 An incremental **Spark Structured Streaming** pipeline that ingests **GH Archive**
 events into **Delta Lake** bronze / silver / gold tables, with per-stream
 checkpointing and idempotent `MERGE` upserts for **exactly-once recovery**.
-Built to backfill 100M+ events (a month of GH Archive) and then keep up hour
-by hour, processing only what is new.
+Backfilled **131M events** (four weeks of GH Archive, January 1–28 2024) on a
+single 8-core machine, and keeps up hour by hour afterwards, processing only
+what is new.
 
 ---
 
@@ -91,10 +92,10 @@ github-activity-lakehouse/
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/your-org/github-activity-lakehouse.git
+git clone https://github.com/saisha-l/github-activity-lakehouse-.git github-activity-lakehouse
 cd github-activity-lakehouse
 
-# 2. Install dependencies (requires Python 3.11, Java 11)
+# 2. Install dependencies (requires Python 3.11, Java 17)
 make install
 
 # 3. Download 3 days of data (72 hourly files)
@@ -103,10 +104,47 @@ make download
 # 4. Run the incremental pipeline (processes only new data, then exits)
 make pipeline
 
-# Full-month backfill (~744 hourly files, 100M+ events), streamed in
-# bounded micro-batches; override the window with BACKFILL_START / BACKFILL_END
-make backfill
+# Four-week backfill (2024-01-01..28, ~131M events, ~70 GB of Delta tables).
+# Downloads 3 days at a time and deletes raw files once ingested; override
+# the window with BACKFILL_START / BACKFILL_END
+SPARK_DRIVER_MEMORY=12g make backfill
 ```
+
+### Backfill results (131M events)
+
+`make backfill` over 2024-01-01 → 2024-01-28 on one 8-core / 30 GB machine
+(local Spark 3.5.1, Delta 3.1.0, Java 17):
+
+| Table | Rows |
+|---|---|
+| bronze | 131,170,447 |
+| silver | 131,170,447 |
+| gold/daily_active_repos | 21,898,681 |
+| gold/contributor_retention | 5,035,240 |
+| gold/pr_merge_time | 2,910,093 |
+| gold/top_growing_repos | 1,820,944 |
+
+* Data quality: 0 % null ids, 0 % duplicates, no schema drift, 0 quarantined rows.
+* ~28 min per 3-day chunk (~13M events); ~6 h end to end. Bronze ingests
+  ~14k events/s.
+* Storage: ~0.54 GB per million events for Bronze + Silver with zstd
+  (Bronze keeps every event's raw JSON).
+* The run was interrupted six times (four out-of-memory crashes, two deliberate restarts)
+  and resumed from its checkpoints each time; Bronze and Silver still match
+  row for row with no duplicates, i.e. exactly-once in practice.
+
+Tuning knobs that matter at this scale (environment variables, see
+`conf/config.py`):
+
+| Variable | Default | Why |
+|---|---|---|
+| `SPARK_DRIVER_MEMORY` | `4g` | Local mode runs everything in the driver JVM; 12g was used above. |
+| `MAX_FILES_PER_TRIGGER` | `24` | Raw files per Bronze micro-batch; 8 (one per core) was used above. |
+| `SILVER_MAX_FILES_PER_TRIGGER` | `3` | Bronze files (~600k events each) per Silver micro-batch. |
+| `RAW_CLEAN_SOURCE` | `off` | `delete` removes raw files after their batch commits (`make backfill` sets it). |
+| `SPARK_PARQUET_CODEC` | `zstd` | Half the size of snappy for Bronze's raw JSON. |
+| `SPARK_PARQUET_BLOCK_SIZE_MB` | `32` | Raw JSON expands ~8x on read; 128 MB row groups need ~1 GB heap per task. |
+| `SPARK_LOCAL_CORES` | `*` | Fewer cores = more memory per task when replaying an oversized batch. |
 
 ### Manual pipeline run
 
