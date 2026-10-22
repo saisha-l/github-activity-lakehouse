@@ -350,3 +350,7 @@ Tests use `tmp_path` fixtures so they never pollute `data/`.
    spark.sql("OPTIMIZE delta.`dbfs:/mnt/github-lakehouse/silver/` ZORDER BY (repo_name, date)")
    spark.sql("VACUUM delta.`dbfs:/mnt/github-lakehouse/silver/` RETAIN 168 HOURS")
    ```
+   
+
+## Why I built this
+I wanted to work with data engineering tools and Medallion architecture in practice. 
