@@ -211,7 +211,8 @@ def start_bronze_stream(
     """
     from conf.config import (BRONZE_CHECKPOINT, BRONZE_PATH,
                              BRONZE_QUARANTINE_PATH, MAX_FILES_PER_TRIGGER,
-                             RAW_PATH, STREAM_TRIGGER_INTERVAL)
+                             RAW_ARCHIVE_PATH, RAW_CLEAN_SOURCE, RAW_PATH,
+                             STREAM_TRIGGER_INTERVAL)
 
     raw_path = raw_path or RAW_PATH
     bronze_path = bronze_path or BRONZE_PATH
@@ -223,11 +224,15 @@ def start_bronze_stream(
         os.makedirs(raw_path, exist_ok=True)
     _ensure_bronze_table(spark, bronze_path)
 
-    lines = (
-        spark.readStream.format("text")
-        .option("maxFilesPerTrigger", max_files_per_trigger or MAX_FILES_PER_TRIGGER)
-        .load(raw_path)
+    reader = spark.readStream.format("text").option(
+        "maxFilesPerTrigger", max_files_per_trigger or MAX_FILES_PER_TRIGGER
     )
+    if RAW_CLEAN_SOURCE != "off":
+        # Spark only cleans files from batches already in the checkpoint.
+        reader = reader.option("cleanSource", RAW_CLEAN_SOURCE)
+        if RAW_CLEAN_SOURCE == "archive":
+            reader = reader.option("sourceArchiveDir", RAW_ARCHIVE_PATH)
+    lines = reader.load(raw_path)
 
     app_id: dict = {}
 

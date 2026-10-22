@@ -40,7 +40,8 @@ def get_spark(
     -------
     SparkSession
     """
-    from conf.config import SPARK_SHUFFLE_PARTITIONS
+    from conf.config import (SPARK_PARQUET_BLOCK_SIZE_MB, SPARK_PARQUET_CODEC,
+                             SPARK_SHUFFLE_PARTITIONS)
 
     n_partitions = shuffle_partitions or SPARK_SHUFFLE_PARTITIONS
 
@@ -60,6 +61,8 @@ def get_spark(
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
         .config("spark.sql.adaptive.skewJoin.enabled", "true")
+        .config("spark.sql.parquet.compression.codec", SPARK_PARQUET_CODEC)
+        .config("spark.hadoop.parquet.block.size", str(SPARK_PARQUET_BLOCK_SIZE_MB * 1024 * 1024))
         # --- Delta-specific ---
         .config("spark.databricks.delta.retentionDurationCheck.enabled", "false")
         .config("spark.delta.logStore.class",
@@ -69,10 +72,19 @@ def get_spark(
         # --- Structured Streaming ---
         # Keep enough progress history to report totals for long backfills.
         .config("spark.sql.streaming.numRecentProgressUpdates", "1000")
+        # Shuffle files are only removed once the JVM garbage-collects their
+        # ShuffleDependency.  Spark forces a GC every 30 min by default, so a
+        # long backfill would pile up tens of GB of finished micro-batches'
+        # shuffle data on local disk.
+        .config("spark.cleaner.periodicGC.interval", "2min")
     )
 
     if local:
-        builder = builder.master("local[*]")
+        from conf.config import SPARK_DRIVER_MEMORY, SPARK_LOCAL_CORES
+
+        builder = builder.master(f"local[{SPARK_LOCAL_CORES}]").config(
+            "spark.driver.memory", SPARK_DRIVER_MEMORY
+        )
         # Python workers must use the driver's interpreter (e.g. the venv).
         os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
 

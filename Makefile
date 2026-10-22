@@ -25,7 +25,7 @@ help:
 	@echo "  make download   Download 3 days of GH Archive data (2024-01-01 to 2024-01-03)"
 	@echo "  make pipeline   Incremental streaming run (availableNow): only new data, then exit"
 	@echo "  make stream     Long-running streaming pipeline (1-minute micro-batches)"
-	@echo "  make backfill   Download a month of GH Archive (BACKFILL_START..BACKFILL_END) and stream it"
+	@echo "  make backfill   Chunked download + stream of BACKFILL_START..BACKFILL_END (~125M events)"
 	@echo "  make rebuild    Batch full rebuild of every layer (idempotent)"
 	@echo "  make stats      Print row counts / Delta versions of every table"
 	@echo "  make clean      Remove generated data/ directories"
@@ -65,8 +65,9 @@ download:
 # ---------------------------------------------------------------------------
 # pipeline
 # ---------------------------------------------------------------------------
+# Jan 1-28 2024 (four full weeks) is ~125M events.
 BACKFILL_START ?= 2024-01-01
-BACKFILL_END   ?= 2024-01-31
+BACKFILL_END   ?= 2024-01-28
 
 pipeline:
 	PYTHONPATH=. $(PYTHON) scripts/run_pipeline.py --streaming \
@@ -76,11 +77,11 @@ stream:
 	PYTHONPATH=. $(PYTHON) scripts/run_pipeline.py --streaming \
 		--bronze --silver --gold --trigger-interval "1 minute"
 
+# Downloads and streams a few days at a time, deleting raw files once
+# ingested, so peak disk use is the lakehouse plus one chunk of raw data.
 backfill:
-	PYTHONPATH=. $(PYTHON) scripts/download_data.py \
-		--start $(BACKFILL_START) --end $(BACKFILL_END) --workers 8
-	PYTHONPATH=. $(PYTHON) scripts/run_pipeline.py --streaming \
-		--bronze --silver --gold --dq --stats
+	PYTHONPATH=. $(PYTHON) scripts/backfill.py \
+		--start $(BACKFILL_START) --end $(BACKFILL_END)
 
 rebuild:
 	PYTHONPATH=. $(PYTHON) scripts/run_pipeline.py \

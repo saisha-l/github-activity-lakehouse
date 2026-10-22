@@ -33,6 +33,17 @@ DEDUP_KEY = "id"
 MAX_FILES_PER_TRIGGER = int(os.environ.get("MAX_FILES_PER_TRIGGER", "24"))
 # Delta files per Silver / Gold micro-batch.
 DELTA_MAX_FILES_PER_TRIGGER = int(os.environ.get("DELTA_MAX_FILES_PER_TRIGGER", "200"))
+# Bronze files per Silver micro-batch.  Each Bronze micro-batch lands as one
+# large file per date (~0.5-1 GB, ~600k events), and parsing a whole
+# multi-day backlog of raw JSON in one batch runs the driver out of heap, so
+# Silver takes a few files at a time.
+SILVER_MAX_FILES_PER_TRIGGER = int(os.environ.get("SILVER_MAX_FILES_PER_TRIGGER", "3"))
+# What the Bronze file stream does with a raw file once its micro-batch is
+# committed: "off" (keep), "delete", or "archive" (move to RAW_ARCHIVE_PATH).
+# "delete" keeps disk usage flat during large backfills — a file is only
+# removed after the checkpoint records it, so recovery is unaffected.
+RAW_CLEAN_SOURCE = os.environ.get("RAW_CLEAN_SOURCE", "off")
+RAW_ARCHIVE_PATH = os.environ.get("RAW_ARCHIVE_PATH", os.path.join(LAKEHOUSE_ROOT, "raw_archive"))
 
 # ---------------------------------------------------------------------------
 # Streaming
@@ -56,6 +67,18 @@ GHARCHIVE_BASE_URL = "https://data.gharchive.org"
 # ---------------------------------------------------------------------------
 SPARK_SHUFFLE_PARTITIONS = int(os.environ.get("SPARK_SHUFFLE_PARTITIONS", "200"))
 SPARK_DEFAULT_PARALLELISM = int(os.environ.get("SPARK_DEFAULT_PARALLELISM", "8"))
+# Local mode runs everything in the driver JVM, so this is the job's whole
+# heap.  Spark's 1g default is far too small for day-sized micro-batches.
+SPARK_DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "4g")
+# Bronze stores every event's raw JSON; zstd shrinks it far more than Spark's
+# default snappy, which decides whether a month-scale backfill fits on disk.
+SPARK_PARQUET_CODEC = os.environ.get("SPARK_PARQUET_CODEC", "zstd")
+# Parquet row-group size.  A reader holds a whole decompressed row group in
+# memory, and Bronze's raw JSON expands ~8x, so the 128 MB default means ~1 GB
+# of heap per concurrent task.  32 MB keeps that ~250 MB.
+SPARK_PARQUET_BLOCK_SIZE_MB = int(os.environ.get("SPARK_PARQUET_BLOCK_SIZE_MB", "32"))
+# Cores for local mode ("*" = all).  Lower it to cut peak memory.
+SPARK_LOCAL_CORES = os.environ.get("SPARK_LOCAL_CORES", "*")
 
 # ---------------------------------------------------------------------------
 # Data-quality thresholds
